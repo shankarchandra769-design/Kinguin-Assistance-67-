@@ -1,0 +1,14 @@
+# Environment variables - NEVER upload to GitHub
+.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+venv/
+env/
+
+# OS files
+.DS_Store
+Thumbs.db
