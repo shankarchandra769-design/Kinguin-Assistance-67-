@@ -1,12 +1,27 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
+import logging
+import time
 import json
 import os
 from keep_alive import keep_alive
 import asyncio
+from collections import defaultdict
+
 # ── Config ──────────────────────────────────────────────────────────────────
 intents = discord.Intents.all()
-bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+
+# Use larger cache sizes and smart http settings to reduce API calls
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+    help_command=None,
+    max_messages=1000,        # Cache more messages locally = fewer API calls
+)
+
+# ── Cooldown tracker — prevents spam which causes rate limits ────────────────
+user_cooldowns = defaultdict(lambda: 0)
+COOLDOWN_SECONDS = 2  # minimum seconds between commands per user
 
 CONFIG_FILE = "config.json"
 TICKETS_FILE = "tickets.json"
@@ -59,7 +74,39 @@ def save_tickets(t):
     save_json(TICKETS_FILE, t)
 
 def has_any_role(member, role_ids):
-    return any(r.id in role_ids for r in member.roles)
+    """Returns True if member:
+    - Has one of the exact roles
+    - Has a role higher than any of the given roles
+    - Is an administrator
+    """
+    # Admins always pass
+    if member.guild_permissions.administrator:
+        return True
+
+    if not role_ids:
+        return False
+
+    # Get the highest position among the target roles
+    guild_roles = {r.id: r for r in member.guild.roles}
+    target_positions = [
+        guild_roles[rid].position
+        for rid in role_ids
+        if rid in guild_roles
+    ]
+
+    if not target_positions:
+        return False
+
+    highest_target = max(target_positions)
+
+    # Check if member has any of the exact roles OR any role higher than the highest target role
+    for r in member.roles:
+        if r.id in role_ids:
+            return True
+        if r.position > highest_target:
+            return True
+
+    return False
 
 def embed(title, description, color=0x5865F2, footer=None):
     e = discord.Embed(title=title, description=description, color=color)
@@ -118,12 +165,25 @@ class TicketFormModal(discord.ui.Modal, title="🎫 Create a Ticket"):
         member = interaction.user
 
         # Resolve the other user
-        raw = self.user_id.value.strip().lstrip("@<>!").split(">")[0]
+        raw = self.user_id.value.strip()
         other_member = None
+        user_not_in_server = False
+
+        # Try to extract a user ID from mention or raw ID
+        cleaned = raw.lstrip("<@!>").rstrip(">").replace("<@", "").replace("!", "").replace(">", "").strip()
         try:
-            uid = int(raw.replace("<@", "").replace("!", "").replace(">", ""))
+            uid = int(cleaned)
+            # It's a valid ID or mention — try to find them
             other_member = guild.get_member(uid) or await guild.fetch_member(uid)
-        except:
+            if other_member is None:
+                user_not_in_server = True
+        except ValueError:
+            # Not a number/mention — user just typed a name, don't show error
+            pass
+        except discord.NotFound:
+            # Valid ID format but user not in server
+            user_not_in_server = True
+        except Exception:
             pass
 
         # Create ticket channel
@@ -175,7 +235,12 @@ class TicketFormModal(discord.ui.Modal, title="🎫 Create a Ticket"):
         save_tickets(tickets)
 
         # Build ticket embed
-        other_display = other_member.mention if other_member else f"⚠️ User not found (`{self.user_id.value}`)"
+        if other_member:
+            other_display = other_member.mention
+        elif user_not_in_server:
+            other_display = f"⚠️ User not found in server (`{self.user_id.value}`)"
+        else:
+            other_display = self.user_id.value  # just show what they typed
         ticket_embed = discord.Embed(
             title=f"🎫 Ticket — {self.option_label}",
             color=0x5865F2
@@ -252,8 +317,16 @@ class TicketActionsView(discord.ui.View):
 
     @discord.ui.button(label="Close Ticket", style=discord.ButtonStyle.danger, emoji="🔒", custom_id="close_ticket_btn")
     async def close_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await close_ticket_channel(interaction.channel, interaction.user)
+        cfg = get_config()
+        allowed = [int(r) for r in cfg.get("ticket_support_roles", [])]
+        if not has_any_role(interaction.user, allowed):
+            await interaction.response.send_message(
+                embed=embed("❌ No Permission", "Only support roles can close tickets.", color=0xED4245),
+                ephemeral=True
+            )
+            return
         await interaction.response.defer()
+        await close_ticket_channel(interaction.channel, interaction.user)
 
 
 class ConfirmTradeView(discord.ui.View):
@@ -382,6 +455,22 @@ async def on_ready():
     cfg = get_config()
     if cfg.get("ticket_options"):
         bot.add_view(TicketPanelView(cfg["ticket_options"]))
+
+
+@bot.event
+async def on_message(message):
+    # Ignore bots
+    if message.author.bot:
+        return
+
+    # Global per-user cooldown to prevent spam → rate limits
+    uid = message.author.id
+    now = time.time()
+    if now - user_cooldowns[uid] < COOLDOWN_SECONDS:
+        return  # silently ignore — too fast
+    user_cooldowns[uid] = now
+
+    await bot.process_commands(message)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -662,9 +751,9 @@ async def setticketcategory(ctx, category_id: str):
     await ctx.send(embed=embed("✅ Updated", f"Tickets will be created in category `{category_id}`.", color=0x57F287))
 
 
-# ── !adduser <user_id> ───────────────────────────────────────────────────────
+# ── !adduser <user_id or username> ──────────────────────────────────────────
 @bot.command(name="adduser")
-async def adduser(ctx, user_id: str):
+async def adduser(ctx, *, user_input: str):
     cfg = get_config()
     allowed = [int(r) for r in cfg.get("ticket_support_roles", [])] + [int(r) for r in cfg.get("ticket_free_roles", [])]
     if not has_any_role(ctx.author, allowed):
@@ -676,15 +765,35 @@ async def adduser(ctx, user_id: str):
         await ctx.send(embed=embed("❌ Error", "This command can only be used inside a ticket channel.", color=0xED4245))
         return
 
+    member = None
+
+    # Try by ID or mention first
+    cleaned = user_input.strip().replace("<@", "").replace("!", "").replace(">", "").strip()
     try:
-        uid = int(user_id.strip().lstrip("<@!>"))
+        uid = int(cleaned)
         member = ctx.guild.get_member(uid) or await ctx.guild.fetch_member(uid)
-        await ctx.channel.set_permissions(member, read_messages=True, send_messages=True)
-        await ctx.send(embed=embed("✅ User Added", f"{member.mention} has been added to this ticket.", color=0x57F287))
+    except ValueError:
+        # Not an ID — search by username or display name
+        search = user_input.strip().lower().lstrip("@")
+        member = discord.utils.find(
+            lambda m: m.name.lower() == search or m.display_name.lower() == search,
+            ctx.guild.members
+        )
+        # If exact match not found, try partial match
+        if not member:
+            member = discord.utils.find(
+                lambda m: search in m.name.lower() or search in m.display_name.lower(),
+                ctx.guild.members
+            )
     except discord.NotFound:
-        await ctx.send(embed=embed("❌ User Not Found", "The user was not found in this server.", color=0xED4245))
-    except Exception as e:
-        await ctx.send(embed=embed("❌ Error", str(e), color=0xED4245))
+        pass
+
+    if not member:
+        await ctx.send(embed=embed("❌ User Not Found", f"Could not find `{user_input}` in this server. Try using their User ID instead.", color=0xED4245))
+        return
+
+    await ctx.channel.set_permissions(member, read_messages=True, send_messages=True)
+    await ctx.send(embed=embed("✅ User Added", f"{member.mention} has been added to this ticket.", color=0x57F287))
 
 
 # ── !claim ───────────────────────────────────────────────────────────────────
@@ -714,9 +823,55 @@ async def claim(ctx):
     await ctx.send(embed=embed("✅ Claimed", f"{ctx.author.mention} has claimed this ticket!", color=0x57F287))
 
 
+# ── !unclaim ─────────────────────────────────────────────────────────────────
+@bot.command(name="unclaim")
+async def unclaim(ctx):
+    cfg = get_config()
+    allowed = [int(r) for r in cfg.get("ticket_support_roles", [])]
+    if not has_any_role(ctx.author, allowed):
+        await ctx.send(embed=embed("❌ No Permission", "Only support roles can unclaim tickets.", color=0xED4245))
+        return
+
+    tickets = get_tickets()
+    tid = str(ctx.channel.id)
+    if tid not in tickets:
+        await ctx.send(embed=embed("❌ Error", "This is not a ticket channel.", color=0xED4245))
+        return
+
+    if not tickets[tid]["claimed_by"]:
+        await ctx.send(embed=embed("⚠️ Not Claimed", "This ticket has not been claimed yet.", color=0xFEE75C))
+        return
+
+    # Remove claim
+    tickets[tid]["claimed_by"] = None
+    save_tickets(tickets)
+
+    # Remove send permissions from the person who unclaimed
+    await ctx.channel.set_permissions(ctx.author, read_messages=True, send_messages=False, use_application_commands=False)
+
+    # Ping all support roles
+    pings = " ".join(
+        ctx.guild.get_role(int(rid)).mention
+        for rid in cfg.get("ticket_support_roles", [])
+        if ctx.guild.get_role(int(rid))
+    )
+
+    unclaim_embed = discord.Embed(
+        title="🔓 Ticket Unclaimed",
+        description=f"{ctx.author.mention} has unclaimed this ticket.\nThis ticket needs a new support member!",
+        color=0xFEE75C
+    )
+    await ctx.send(content=pings if pings else None, embed=unclaim_embed)
+
+
 # ── !close ───────────────────────────────────────────────────────────────────
 @bot.command(name="close")
 async def close(ctx):
+    cfg = get_config()
+    allowed = [int(r) for r in cfg.get("ticket_support_roles", [])]
+    if not has_any_role(ctx.author, allowed):
+        await ctx.send(embed=embed("❌ No Permission", "Only support roles can close tickets.", color=0xED4245))
+        return
     tickets = get_tickets()
     if str(ctx.channel.id) not in tickets:
         await ctx.send(embed=embed("❌ Error", "This is not a ticket channel.", color=0xED4245))
@@ -868,8 +1023,9 @@ async def help_cmd(ctx):
 
     h.add_field(name="🎫 Ticket Commands", value="""
 `!claim` — Claim a ticket *(support role)*
-`!close` — Close & delete the ticket channel
-`!adduser <user_id>` — Add a user to the ticket *(support/free role)*
+`!unclaim` — Unclaim a ticket & ping all support roles *(support role)*
+`!close` — Close & delete the ticket channel *(support role only)*
+`!adduser <@user, username, or ID>` — Add a user to the ticket *(support/free role)*
 `!confirmtrade` — Show confirm trade buttons *(support/free role)*
 `!cooked` — Send the "YOU ARE SCAMMED" embed with rich/poor buttons *(support role)*
 """, inline=False)
@@ -883,6 +1039,23 @@ async def help_cmd(ctx):
     await ctx.send(embed=h)
 
 
+# ── Rate limit / error handler ───────────────────────────────────────────────
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
+        return
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send(embed=embed("❌ No Permission", "You don't have permission to use this command.", color=0xED4245))
+        return
+    if isinstance(error, discord.errors.HTTPException) and error.status == 429:
+        retry_after = error.retry_after if hasattr(error, 'retry_after') else 30
+        print(f"⚠️ Rate limited! Waiting {retry_after:.2f} seconds...")
+        await asyncio.sleep(retry_after)
+        await ctx.reinvoke()
+        return
+    print(f"❌ Command error: {error}")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  RUN
 # ══════════════════════════════════════════════════════════════════════════════
@@ -891,4 +1064,21 @@ if not TOKEN:
     print("❌ ERROR: Set DISCORD_TOKEN environment variable.")
 else:
     keep_alive()
-    bot.run(TOKEN)
+    # Auto reconnect loop — if bot crashes it will restart after 10 seconds
+    while True:
+        try:
+            bot.run(TOKEN, reconnect=True)
+        except discord.errors.HTTPException as e:
+            if e.status == 429:
+                wait = 60
+                print(f"⚠️ Rate limited on login! Waiting {wait} seconds before retrying...")
+                time.sleep(wait)
+            else:
+                print(f"❌ HTTP error: {e}")
+                time.sleep(10)
+        except discord.errors.LoginFailure:
+            print("❌ Invalid token! Please check your DISCORD_TOKEN in Render environment variables.")
+            break
+        except Exception as e:
+            print(f"❌ Unexpected error: {e} — Restarting in 10 seconds...")
+            time.sleep(10)
