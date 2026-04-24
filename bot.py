@@ -507,7 +507,7 @@ async def sendmsg(ctx, channel_id: str = None, *, message: str = None):
         import re
         links = re.findall(r'https?://\S+', message)
 
-        # Build embed (without links so it looks clean)
+        # Build embed
         msg_embed = discord.Embed(description=message, color=0x5865F2)
 
         # If an image is attached, use the first one
@@ -526,9 +526,10 @@ async def sendmsg(ctx, channel_id: str = None, *, message: str = None):
         else:
             await ch.send(embed=msg_embed)
 
-        # If message contains links, send them as normal message so preview shows
+        # Send links as invisible-text message (|| spoiler hides text but still shows preview)
         if links:
-            await ch.send("\n".join(links))
+            for link in links:
+                await ch.send(f"|| {link} ||")
 
         await ctx.send(embed=embed("✅ Sent", f"Message sent to {ch.mention}.", color=0x57F287))
     except Exception as e:
