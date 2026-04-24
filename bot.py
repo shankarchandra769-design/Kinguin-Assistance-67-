@@ -503,22 +503,32 @@ async def sendmsg(ctx, channel_id: str = None, *, message: str = None):
             await ctx.send(embed=embed("❌ Error", "Channel not found.", color=0xED4245))
             return
 
-        msg_embed = embed("📢 Message", message)
+        # Extract links from message
+        import re
+        links = re.findall(r'https?://\S+', message)
+
+        # Build embed (without links so it looks clean)
+        msg_embed = discord.Embed(description=message, color=0x5865F2)
 
         # If an image is attached, use the first one
         file_to_send = None
         if ctx.message.attachments:
             attachment = ctx.message.attachments[0]
             if any(attachment.filename.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".gif", ".webp"]):
-                file_bytes = await attachment.read()
                 import io
+                file_bytes = await attachment.read()
                 file_to_send = discord.File(io.BytesIO(file_bytes), filename=attachment.filename)
                 msg_embed.set_image(url=f"attachment://{attachment.filename}")
 
+        # Send embed first
         if file_to_send:
             await ch.send(embed=msg_embed, file=file_to_send)
         else:
             await ch.send(embed=msg_embed)
+
+        # If message contains links, send them as normal message so preview shows
+        if links:
+            await ch.send("\n".join(links))
 
         await ctx.send(embed=embed("✅ Sent", f"Message sent to {ch.mention}.", color=0x57F287))
     except Exception as e:
