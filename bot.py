@@ -191,6 +191,15 @@ class TicketFormModal(discord.ui.Modal, title="🎫 Create a Ticket"):
         if cfg.get("ticket_category"):
             category = guild.get_channel(int(cfg["ticket_category"]))
 
+        # Hide the category from everyone (so category itself is invisible)
+        if category:
+            try:
+                await category.set_permissions(guild.default_role, read_messages=False)
+            except Exception:
+                pass
+
+        # Ticket channel gets its OWN overwrites (not inherited from category)
+        # This makes the channel visible only to relevant people
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(read_messages=False),
             member: discord.PermissionOverwrite(read_messages=True, send_messages=True),
@@ -748,7 +757,17 @@ async def setticketcategory(ctx, category_id: str):
     cfg = get_config()
     cfg["ticket_category"] = category_id
     save_config(cfg)
-    await ctx.send(embed=embed("✅ Updated", f"Tickets will be created in category `{category_id}`.", color=0x57F287))
+
+    # Auto hide the category from everyone
+    category = ctx.guild.get_channel(int(category_id))
+    if category:
+        try:
+            await category.set_permissions(ctx.guild.default_role, read_messages=False)
+            await ctx.send(embed=embed("✅ Updated", f"Ticket category set and **hidden** from all members. Tickets will appear inside it only for the people involved.", color=0x57F287))
+        except Exception as e:
+            await ctx.send(embed=embed("✅ Updated", f"Category set but couldn't auto-hide it: `{e}`\nPlease hide it manually in Discord.", color=0xFEE75C))
+    else:
+        await ctx.send(embed=embed("✅ Updated", f"Tickets will be created in category `{category_id}`.", color=0x57F287))
 
 
 # ── !adduser <user_id or username> ──────────────────────────────────────────
